@@ -181,6 +181,13 @@ async function readZipPayload(url: string): Promise<{ buffer: ArrayBuffer; offse
   // 读取中央目录偏移量
   const cdOffset = endView.getUint32(eocdOffset + 16, true);
   const cdSize = endView.getUint32(eocdOffset + 12, true);
+  const totalEntries = endView.getUint16(eocdOffset + 10, true);
+  
+  console.log('ZIP central directory info:', {
+    offset: cdOffset,
+    size: cdSize,
+    entries: totalEntries
+  });
   
   // 读取中央目录
   const cdResponse = await fetch(url, {
@@ -197,11 +204,13 @@ async function readZipPayload(url: string): Promise<{ buffer: ArrayBuffer; offse
   const cdBuffer = await cdResponse.arrayBuffer();
   const cdView = new DataView(cdBuffer);
   let offset = 0;
+  const possibleNames = ['payload.bin', 'PAYLOAD.BIN', 'payload.img', 'PAYLOAD.IMG'];
 
   // 遍历中央目录寻找 payload.bin
   while (offset < cdBuffer.byteLength) {
     const signature = cdView.getUint32(offset, true);
     if (signature !== 0x02014b50) { // 中央目录文件头标记
+      console.log('Reached end of central directory at offset:', offset);
       break;
     }
 
@@ -209,12 +218,32 @@ async function readZipPayload(url: string): Promise<{ buffer: ArrayBuffer; offse
     const extraFieldLength = cdView.getUint16(offset + 30, true);
     const fileCommentLength = cdView.getUint16(offset + 32, true);
     const localHeaderOffset = cdView.getUint32(offset + 42, true);
+    const compressionMethod = cdView.getUint16(offset + 10, true);
     
     // 读取文件名
     const fileNameBytes = new Uint8Array(cdBuffer, offset + 46, fileNameLength);
     const fileName = new TextDecoder().decode(fileNameBytes);
+    
+    console.log('Found file in ZIP:', {
+      name: fileName,
+      compression: compressionMethod,
+      offset: localHeaderOffset
+    });
 
-    if (fileName === 'payload.bin') {
+    // 检查是否是我们要找的文件
+    const isPayloadFile = possibleNames.some(name => 
+      fileName.toLowerCase().endsWith(name.toLowerCase())
+    );
+
+    if (isPayloadFile) {
+      console.log('Found potential payload file:', fileName);
+      
+      if (compressionMethod !== 0) {
+        console.log('File is compressed, trying next file...');
+        offset += 46 + fileNameLength + extraFieldLength + fileCommentLength;
+        continue;
+      }
+
       // 读取本地文件头
       const headerResponse = await fetch(url, {
         headers: {
@@ -237,26 +266,43 @@ async function readZipPayload(url: string): Promise<{ buffer: ArrayBuffer; offse
 
       const localFileNameLength = headerView.getUint16(26, true);
       const localExtraFieldLength = headerView.getUint16(28, true);
-      const compressionMethod = headerView.getUint16(8, true);
 
-      if (compressionMethod !== 0) {
-        throw new Error('Compressed payload.bin is not supported');
+      // 计算文件数据的实际起始位置
+      const fileDataOffset = localHeaderOffset + 30 + localFileNameLength + localExtraFieldLength;
+      
+      // 验证文件头部是否为 payload 格式
+      const payloadHeaderResponse = await fetch(url, {
+        headers: {
+          'Range': `bytes=${fileDataOffset}-${fileDataOffset + 7}`,
+          'Accept': '*/*',
+        }
+      });
+
+      if (!payloadHeaderResponse.ok) {
+        console.log('Failed to read payload header, trying next file...');
+        offset += 46 + fileNameLength + extraFieldLength + fileCommentLength;
+        continue;
       }
 
-      // 计算 payload.bin 的实际起始位置
-      const fileDataOffset = localHeaderOffset + 30 + localFileNameLength + localExtraFieldLength;
-      console.log('Found payload.bin at offset:', fileDataOffset);
+      const payloadHeaderBuffer = await payloadHeaderResponse.arrayBuffer();
+      const payloadHeaderView = new DataView(payloadHeaderBuffer);
+      const payloadMagic = payloadHeaderView.getUint32(0, true);
 
-      return {
-        offset: fileDataOffset,
-        buffer: new ArrayBuffer(0) // 占位符
-      };
+      if (payloadMagic === 0xed26ff3a) {
+        console.log('Found valid payload file at offset:', fileDataOffset);
+        return {
+          offset: fileDataOffset,
+          buffer: new ArrayBuffer(0) // 占位符
+        };
+      } else {
+        console.log('Invalid payload magic number, trying next file...');
+      }
     }
 
     offset += 46 + fileNameLength + extraFieldLength + fileCommentLength;
   }
 
-  throw new Error('payload.bin not found in ZIP central directory');
+  throw new Error('No valid payload file found in ZIP central directory');
 }
 
 // 读取 payload.bin 头部信息
