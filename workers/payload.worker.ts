@@ -62,6 +62,92 @@ const getBaseUrl = () => {
   }
 };
 
+// 下载指定范围的数据，支持分块下载
+async function downloadRange(url: string, start: number, end: number, maxChunkSize: number = 5 * 1024 * 1024): Promise<ArrayBuffer> {
+  // 安全检查
+  if (start < 0 || end < start || end > Number.MAX_SAFE_INTEGER) {
+    throw new Error(`Invalid range: ${start}-${end}`);
+  }
+
+  const totalSize = end - start + 1;
+  console.log(`Downloading range: bytes=${start}-${end} (${totalSize} bytes)`);
+
+  // 如果大小小于最大块大小，直接下载
+  if (totalSize <= maxChunkSize) {
+    const response = await fetch(url, {
+      headers: {
+        'Range': `bytes=${start}-${end}`,
+        'Accept': '*/*',
+      }
+    });
+
+    if (!response.ok && response.status !== 206) {
+      const errorText = await response.text();
+      console.error('Range request failed:', {
+        status: response.status,
+        statusText: response.statusText,
+        headers: Object.fromEntries(response.headers.entries()),
+        error: errorText
+      });
+      throw new Error(`Failed to fetch range: ${response.status} ${response.statusText}\n${errorText}`);
+    }
+
+    return response.arrayBuffer();
+  }
+
+  // 分块下载
+  const chunks: ArrayBuffer[] = [];
+  let currentStart = start;
+  let retryCount = 0;
+  const maxRetries = 3;
+
+  while (currentStart <= end) {
+    const chunkEnd = Math.min(currentStart + maxChunkSize - 1, end);
+    console.log(`Downloading chunk: bytes=${currentStart}-${chunkEnd}`);
+
+    try {
+      const response = await fetch(url, {
+        headers: {
+          'Range': `bytes=${currentStart}-${chunkEnd}`,
+          'Accept': '*/*',
+        }
+      });
+
+      if (!response.ok && response.status !== 206) {
+        throw new Error(`Failed to fetch chunk: ${response.status} ${response.statusText}`);
+      }
+
+      const chunk = await response.arrayBuffer();
+      chunks.push(chunk);
+      currentStart = chunkEnd + 1;
+      retryCount = 0; // 重置重试计数
+    } catch (error: unknown) {
+      console.error(`Error downloading chunk ${currentStart}-${chunkEnd}:`, error);
+      retryCount++;
+      
+      if (retryCount >= maxRetries) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        throw new Error(`Failed to download chunk after ${maxRetries} retries: ${errorMessage}`);
+      }
+      
+      // 等待一段时间后重试
+      await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
+      continue; // 重试当前块
+    }
+  }
+
+  // 合并所有块
+  const totalLength = chunks.reduce((acc, chunk) => acc + chunk.byteLength, 0);
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(new Uint8Array(chunk), offset);
+    offset += chunk.byteLength;
+  }
+
+  return result.buffer;
+}
+
 // 读取 ZIP 文件中的 payload.bin
 async function readZipPayload(url: string): Promise<ArrayBuffer> {
   // 首先读取 ZIP 文件头部来定位 payload.bin
@@ -249,55 +335,6 @@ async function readPayloadHeader(url: string): Promise<PayloadHeader> {
     const errorMessage = error instanceof Error ? error.message : String(error);
     throw new Error(`Failed to parse payload header: ${errorMessage}`);
   }
-}
-
-// 下载指定范围的数据
-async function downloadRange(url: string, start: number, end: number): Promise<ArrayBuffer> {
-  // 安全检查
-  if (start < 0 || end < start || end > Number.MAX_SAFE_INTEGER) {
-    throw new Error(`Invalid range: ${start}-${end}`);
-  }
-
-  console.log(`Downloading range: bytes=${start}-${end}`);
-  const response = await fetch(url, {
-    headers: {
-      'Range': `bytes=${start}-${end}`,
-      'Accept': '*/*',
-    }
-  });
-
-  if (!response.ok && response.status !== 206) {
-    const errorText = await response.text();
-    console.error('Range request failed:', {
-      status: response.status,
-      statusText: response.statusText,
-      headers: Object.fromEntries(response.headers.entries()),
-      error: errorText
-    });
-    throw new Error(`Failed to fetch range: ${response.status} ${response.statusText}\n${errorText}`);
-  }
-
-  const contentRange = response.headers.get('Content-Range');
-  const contentLength = response.headers.get('Content-Length');
-  console.log('Range response headers:', {
-    'Content-Range': contentRange,
-    'Content-Length': contentLength
-  });
-
-  const buffer = await response.arrayBuffer();
-  const expectedSize = end - start + 1;
-  if (buffer.byteLength !== expectedSize) {
-    console.warn('Range size mismatch:', {
-      expected: expectedSize,
-      received: buffer.byteLength,
-      start,
-      end,
-      contentLength,
-      contentRange
-    });
-  }
-
-  return buffer;
 }
 
 self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
