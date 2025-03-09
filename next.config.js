@@ -75,6 +75,10 @@ const nextConfig = {
       },
     ]
   },
+  // 配置代理超时
+  serverRuntimeConfig: {
+    proxyTimeout: 300000, // 5 minutes
+  },
 }
 
 module.exports = nextConfig 

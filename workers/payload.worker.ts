@@ -54,7 +54,11 @@ async function processFile(file: File, partitions: string[]) {
 
 async function processUrl(url: string, partitions: string[]) {
   console.log('Fetching URL:', url);
-  const response = await fetch(url)
+  const proxyUrl = `/api/proxy?url=${encodeURIComponent(url)}`
+  const response = await fetch(proxyUrl)
+  if (!response.ok) {
+    throw new Error(`Failed to fetch: ${response.status} ${response.statusText}`)
+  }
   const arrayBuffer = await response.arrayBuffer()
   await processPayloadBuffer(arrayBuffer, partitions)
 }
