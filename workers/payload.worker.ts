@@ -83,11 +83,27 @@ async function readPayloadHeader(url: string): Promise<PayloadHeader> {
   const view = new DataView(buffer);
   
   try {
-    // 读取版本号（前 4 个字节）
-    const version = view.getUint32(0, true);
-    
+    // 读取魔数（前 4 个字节）
+    const magic = view.getUint32(0, true);
+    if (magic !== 0xed26ff3a) { // PAYLOAD_MAGIC
+      throw new Error(`Invalid magic number: ${magic.toString(16)}`);
+    }
+
+    // 读取版本号（接下来的 4 个字节）
+    const version = view.getUint32(4, true);
+    if (version !== 2) { // PAYLOAD_VERSION=2
+      throw new Error(`Unsupported version: ${version}`);
+    }
+
+    // 读取头部大小（接下来的 8 个字节）
+    const headerSize = Number(view.getBigUint64(8, true));
+    if (headerSize <= 0 || headerSize > buffer.byteLength) {
+      throw new Error(`Invalid header size: ${headerSize}`);
+    }
+
     // 读取清单条目数量（接下来的 4 个字节）
-    const manifestCount = view.getUint32(4, true);
+    const manifestCount = view.getUint32(16, true);
+    console.log('Manifest count:', manifestCount);
     
     // 安全检查
     if (manifestCount <= 0 || manifestCount > 100) {
@@ -95,7 +111,7 @@ async function readPayloadHeader(url: string): Promise<PayloadHeader> {
     }
     
     const manifest = [];
-    let offset = 8; // 从第 8 个字节开始读取清单
+    let offset = 20; // 从第 20 个字节开始读取清单
     
     for (let i = 0; i < manifestCount && offset + 4 <= buffer.byteLength; i++) {
       // 读取分区名长度
@@ -113,7 +129,7 @@ async function readPayloadHeader(url: string): Promise<PayloadHeader> {
       offset += nameLength;
       
       // 安全检查
-      if (offset + 24 > buffer.byteLength) { // 8 bytes for size + 16 bytes for offset
+      if (offset + 24 > buffer.byteLength) { // 8 bytes for size + 8 bytes for offset + 8 bytes for padding
         throw new Error(`Buffer overflow at entry ${i}`);
       }
       
@@ -157,6 +173,7 @@ async function downloadRange(url: string, start: number, end: number): Promise<A
     throw new Error(`Invalid range: ${start}-${end}`);
   }
 
+  console.log(`Downloading range: bytes=${start}-${end}`);
   const response = await fetch(url, {
     headers: {
       'Range': `bytes=${start}-${end}`,
@@ -166,12 +183,33 @@ async function downloadRange(url: string, start: number, end: number): Promise<A
 
   if (!response.ok && response.status !== 206) {
     const errorText = await response.text();
+    console.error('Range request failed:', {
+      status: response.status,
+      statusText: response.statusText,
+      headers: Object.fromEntries(response.headers.entries()),
+      error: errorText
+    });
     throw new Error(`Failed to fetch range: ${response.status} ${response.statusText}\n${errorText}`);
   }
 
+  const contentRange = response.headers.get('Content-Range');
+  const contentLength = response.headers.get('Content-Length');
+  console.log('Range response headers:', {
+    'Content-Range': contentRange,
+    'Content-Length': contentLength
+  });
+
   const buffer = await response.arrayBuffer();
-  if (buffer.byteLength !== (end - start + 1)) {
-    console.warn(`Expected ${end - start + 1} bytes but got ${buffer.byteLength} bytes`);
+  const expectedSize = end - start + 1;
+  if (buffer.byteLength !== expectedSize) {
+    console.warn('Range size mismatch:', {
+      expected: expectedSize,
+      received: buffer.byteLength,
+      start,
+      end,
+      contentLength,
+      contentRange
+    });
   }
 
   return buffer;
@@ -224,8 +262,9 @@ async function processUrl(url: string, partitions: string[]) {
   
   try {
     // 首先读取头部信息
+    console.log('Reading payload header...');
     const header = await readPayloadHeader(finalUrl);
-    console.log('Payload header:', header);
+    console.log('Payload header:', JSON.stringify(header, null, 2));
 
     // 为每个请求的分区创建 blob
     for (const partitionName of partitions) {
@@ -233,23 +272,31 @@ async function processUrl(url: string, partitions: string[]) {
         // 查找分区信息
         const partition = header.manifest.find(m => m.name === partitionName);
         if (!partition) {
-          console.warn(`Partition ${partitionName} not found in manifest`);
+          console.warn(`Partition ${partitionName} not found in manifest. Available partitions:`, 
+            header.manifest.map(m => m.name).join(', '));
           continue;
         }
 
-        console.log(`Downloading partition ${partitionName} (size: ${partition.size}, offset: ${partition.offset})`);
+        console.log(`Downloading partition ${partitionName}:`, {
+          size: partition.size,
+          offset: partition.offset
+        });
         
         // 下载分区数据
         const partitionData = await downloadRange(finalUrl, partition.offset, partition.offset + partition.size - 1);
         
         // 验证下载的数据大小
         if (partitionData.byteLength !== partition.size) {
-          console.warn(`Downloaded size (${partitionData.byteLength}) doesn't match expected size (${partition.size}) for partition ${partitionName}`);
+          console.warn(`Size mismatch for partition ${partitionName}:`, {
+            expected: partition.size,
+            received: partitionData.byteLength
+          });
         }
         
         // 创建 blob
         const blob = new Blob([partitionData], { type: 'application/octet-stream' });
         const url = URL.createObjectURL(blob);
+        console.log(`Created blob URL for partition ${partitionName}:`, url);
         
         // 发送进度消息
         self.postMessage({
