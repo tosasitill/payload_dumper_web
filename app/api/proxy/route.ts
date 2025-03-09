@@ -14,11 +14,14 @@ export async function GET(request: NextRequest) {
         'Access-Control-Allow-Origin': origin,
         'Access-Control-Allow-Methods': 'GET, OPTIONS',
         'Access-Control-Allow-Headers': 'Range',
+        'Access-Control-Allow-Credentials': 'true',
       }
     })
   }
 
-  console.log('Proxying request to:', url)
+  // 清理 URL
+  const cleanUrl = url.replace(/^blob:\/+/g, '');
+  console.log('Proxying request to:', cleanUrl);
 
   try {
     const controller = new AbortController()
@@ -26,7 +29,9 @@ export async function GET(request: NextRequest) {
 
     const headers: HeadersInit = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-      'Accept': '*/*'
+      'Accept': '*/*',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Connection': 'keep-alive'
     }
 
     // 如果有 Range 头，则转发它
@@ -34,9 +39,10 @@ export async function GET(request: NextRequest) {
       headers['Range'] = rangeHeader
     }
 
-    const response = await fetch(url, {
+    const response = await fetch(cleanUrl, {
       signal: controller.signal,
-      headers
+      headers,
+      credentials: 'omit' // 不发送凭证到目标服务器
     })
 
     clearTimeout(timeoutId)
@@ -51,6 +57,7 @@ export async function GET(request: NextRequest) {
           'Access-Control-Allow-Origin': origin,
           'Access-Control-Allow-Methods': 'GET, OPTIONS',
           'Access-Control-Allow-Headers': 'Range',
+          'Access-Control-Allow-Credentials': 'true',
           'Access-Control-Expose-Headers': 'Content-Range, Accept-Ranges',
         }
       })
@@ -74,6 +81,7 @@ export async function GET(request: NextRequest) {
       'Access-Control-Allow-Origin': origin,
       'Access-Control-Allow-Methods': 'GET, OPTIONS',
       'Access-Control-Allow-Headers': 'Range',
+      'Access-Control-Allow-Credentials': 'true',
       'Access-Control-Expose-Headers': 'Content-Range, Accept-Ranges, Content-Length',
       'Cache-Control': 'no-cache, no-store, must-revalidate',
       'Pragma': 'no-cache',
@@ -100,6 +108,7 @@ export async function GET(request: NextRequest) {
         'Access-Control-Allow-Origin': origin,
         'Access-Control-Allow-Methods': 'GET, OPTIONS',
         'Access-Control-Allow-Headers': 'Range',
+        'Access-Control-Allow-Credentials': 'true',
         'Access-Control-Expose-Headers': 'Content-Range, Accept-Ranges',
         'Vary': 'Origin'
       }
@@ -115,6 +124,7 @@ export async function OPTIONS(request: NextRequest) {
       'Access-Control-Allow-Origin': origin,
       'Access-Control-Allow-Methods': 'GET, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Range',
+      'Access-Control-Allow-Credentials': 'true',
       'Access-Control-Expose-Headers': 'Content-Range, Accept-Ranges, Content-Length',
       'Access-Control-Max-Age': '86400',
       'Vary': 'Origin'

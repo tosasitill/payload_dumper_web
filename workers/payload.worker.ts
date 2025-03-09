@@ -27,6 +27,11 @@ const getBaseUrl = () => {
     // 尝试从 self.location 获取基础 URL
     if (typeof self !== 'undefined' && self.location) {
       const url = new URL(self.location.href);
+      // 如果是 blob URL，需要解析实际的源
+      if (url.protocol === 'blob:') {
+        const actualUrl = url.pathname; // blob: URL 的 pathname 是实际的 URL
+        return new URL(actualUrl).origin;
+      }
       return `${url.protocol}//${url.host}`;
     }
     
@@ -51,14 +56,21 @@ const getBaseUrl = () => {
 // 分块下载文件
 async function downloadInChunks(url: string, chunkSize: number = 10 * 1024 * 1024): Promise<ArrayBuffer> {
   // 确保我们使用的是完整的 URL
-  const fullUrl = url.startsWith('http') ? url : `${getBaseUrl()}${url.startsWith('/') ? '' : '/'}${url}`;
+  let fullUrl = url;
+  if (!url.startsWith('http')) {
+    // 移除任何可能的 blob:// 前缀
+    const cleanUrl = url.replace(/^blob:\/+/g, '');
+    const baseUrl = getBaseUrl();
+    fullUrl = `${baseUrl}${cleanUrl.startsWith('/') ? '' : '/'}${cleanUrl}`;
+  }
   console.log('Downloading from full URL:', fullUrl);
 
   const firstResponse = await fetch(fullUrl, {
     headers: { 
       'Range': 'bytes=0-0',
       'Accept': '*/*',
-    }
+    },
+    credentials: 'same-origin'
   });
 
   if (!firstResponse.ok && firstResponse.status !== 206) {
@@ -73,7 +85,8 @@ async function downloadInChunks(url: string, chunkSize: number = 10 * 1024 * 102
     const response = await fetch(fullUrl, {
       headers: {
         'Accept': '*/*',
-      }
+      },
+      credentials: 'same-origin'
     });
     if (!response.ok) {
       const errorText = await response.text();
@@ -93,7 +106,8 @@ async function downloadInChunks(url: string, chunkSize: number = 10 * 1024 * 102
       headers: { 
         'Range': `bytes=${start}-${end}`,
         'Accept': '*/*',
-      }
+      },
+      credentials: 'same-origin'
     });
 
     if (!response.ok && response.status !== 206) {
@@ -155,12 +169,14 @@ async function processUrl(url: string, partitions: string[]) {
     throw new Error('Failed to determine base URL');
   }
   
+  // 创建代理 URL
   const proxyUrl = new URL('/api/proxy', baseUrl);
   proxyUrl.searchParams.set('url', url);
-  console.log('Using proxy URL:', proxyUrl.toString());
+  const finalUrl = proxyUrl.toString();
+  console.log('Using proxy URL:', finalUrl);
   
   try {
-    const arrayBuffer = await downloadInChunks(proxyUrl.toString());
+    const arrayBuffer = await downloadInChunks(finalUrl);
     await processPayloadBuffer(arrayBuffer, partitions);
   } catch (error) {
     console.error('Fetch error:', error);
