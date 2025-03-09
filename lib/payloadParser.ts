@@ -21,9 +21,7 @@ export class PayloadParser {
 
   private readUint64(): number {
     const low = this.view.getUint32(this.offset, true);
-    const high = this.view.getUint32(this.offset + 4, true);
-    this.offset += 8;
-    // 由于 JavaScript 的数字精度限制，我们只使用低 32 位
+    this.offset += 8; // 仍然需要跳过 8 字节
     return low;
   }
 
@@ -74,7 +72,6 @@ export class PayloadParser {
     }
 
     const chunks: Uint8Array[] = [];
-    let currentOffset = 0;
 
     for (const operation of partition.operations) {
       switch (operation.type) {
@@ -86,13 +83,11 @@ export class PayloadParser {
             )
           );
           chunks.push(data);
-          currentOffset += operation.dataLength;
           break;
         }
         case OperationType.ZERO: {
           const zeros = new Uint8Array(operation.dataLength);
           chunks.push(zeros);
-          currentOffset += operation.dataLength;
           break;
         }
         default:
