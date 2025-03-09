@@ -150,63 +150,113 @@ async function downloadRange(url: string, start: number, end: number, maxChunkSi
 
 // 读取 ZIP 文件中的 payload.bin
 async function readZipPayload(url: string): Promise<{ buffer: ArrayBuffer; offset: number }> {
-  // 首先读取 ZIP 文件头部来定位 payload.bin
+  // 首先读取 ZIP 文件末尾以查找中央目录
   const response = await fetch(url, {
     headers: {
-      'Range': 'bytes=0-16384', // 读取前 16KB，应该足够包含 ZIP 头部
+      'Range': 'bytes=-65536', // 读取最后 64KB，应该足够包含中央目录
       'Accept': '*/*',
     }
   });
 
   if (!response.ok) {
-    throw new Error(`Failed to fetch ZIP header: ${response.status} ${response.statusText}`);
+    throw new Error(`Failed to fetch ZIP end: ${response.status} ${response.statusText}`);
   }
 
-  const buffer = await response.arrayBuffer();
-  const view = new DataView(buffer);
-  let offset = 0;
-
-  while (offset < buffer.byteLength - 4) {
-    const signature = view.getUint32(offset, true);
-    if (signature === 0x04034b50) { // ZIP 文件头签名
-      // 读取文件名长度
-      const fileNameLength = view.getUint16(offset + 26, true);
-      // 读取扩展字段长度
-      const extraFieldLength = view.getUint16(offset + 28, true);
-      // 读取压缩数据大小
-      const compressedSize = view.getUint32(offset + 18, true);
-      // 读取文件名
-      const fileNameBytes = new Uint8Array(buffer, offset + 30, fileNameLength);
-      const fileName = new TextDecoder().decode(fileNameBytes);
-
-      console.log('Found file in ZIP:', {
-        fileName,
-        compressedSize,
-        offset: offset + 30 + fileNameLength + extraFieldLength
-      });
-
-      if (fileName === 'payload.bin') {
-        // 找到了 payload.bin，返回其在 ZIP 文件中的位置信息
-        const fileStart = offset + 30 + fileNameLength + extraFieldLength;
-        const compressionMethod = view.getUint16(offset + 8, true);
-        if (compressionMethod === 0) { // 0 = 未压缩
-          return {
-            offset: fileStart,
-            buffer: new ArrayBuffer(0) // 占位符
-          };
-        } else {
-          throw new Error('Compressed payload.bin is not supported yet');
-        }
-      }
-
-      // 移动到下一个文件头
-      offset += 30 + fileNameLength + extraFieldLength + compressedSize;
-    } else {
-      offset++;
+  const endBuffer = await response.arrayBuffer();
+  const endView = new DataView(endBuffer);
+  
+  // 从末尾开始查找中央目录结束标记 (0x06054b50)
+  let eocdOffset = -1;
+  for (let i = endBuffer.byteLength - 22; i >= 0; i--) {
+    if (endView.getUint32(i, true) === 0x06054b50) {
+      eocdOffset = i;
+      break;
     }
   }
 
-  throw new Error('payload.bin not found in ZIP file');
+  if (eocdOffset === -1) {
+    throw new Error('ZIP central directory end marker not found');
+  }
+
+  // 读取中央目录偏移量
+  const cdOffset = endView.getUint32(eocdOffset + 16, true);
+  const cdSize = endView.getUint32(eocdOffset + 12, true);
+  
+  // 读取中央目录
+  const cdResponse = await fetch(url, {
+    headers: {
+      'Range': `bytes=${cdOffset}-${cdOffset + cdSize - 1}`,
+      'Accept': '*/*',
+    }
+  });
+
+  if (!cdResponse.ok) {
+    throw new Error(`Failed to fetch ZIP central directory: ${cdResponse.status} ${cdResponse.statusText}`);
+  }
+
+  const cdBuffer = await cdResponse.arrayBuffer();
+  const cdView = new DataView(cdBuffer);
+  let offset = 0;
+
+  // 遍历中央目录寻找 payload.bin
+  while (offset < cdBuffer.byteLength) {
+    const signature = cdView.getUint32(offset, true);
+    if (signature !== 0x02014b50) { // 中央目录文件头标记
+      break;
+    }
+
+    const fileNameLength = cdView.getUint16(offset + 28, true);
+    const extraFieldLength = cdView.getUint16(offset + 30, true);
+    const fileCommentLength = cdView.getUint16(offset + 32, true);
+    const localHeaderOffset = cdView.getUint32(offset + 42, true);
+    
+    // 读取文件名
+    const fileNameBytes = new Uint8Array(cdBuffer, offset + 46, fileNameLength);
+    const fileName = new TextDecoder().decode(fileNameBytes);
+
+    if (fileName === 'payload.bin') {
+      // 读取本地文件头
+      const headerResponse = await fetch(url, {
+        headers: {
+          'Range': `bytes=${localHeaderOffset}-${localHeaderOffset + 1024}`,
+          'Accept': '*/*',
+        }
+      });
+
+      if (!headerResponse.ok) {
+        throw new Error(`Failed to fetch local file header: ${headerResponse.status} ${headerResponse.statusText}`);
+      }
+
+      const headerBuffer = await headerResponse.arrayBuffer();
+      const headerView = new DataView(headerBuffer);
+
+      // 验证本地文件头签名
+      if (headerView.getUint32(0, true) !== 0x04034b50) {
+        throw new Error('Invalid local file header signature');
+      }
+
+      const localFileNameLength = headerView.getUint16(26, true);
+      const localExtraFieldLength = headerView.getUint16(28, true);
+      const compressionMethod = headerView.getUint16(8, true);
+
+      if (compressionMethod !== 0) {
+        throw new Error('Compressed payload.bin is not supported');
+      }
+
+      // 计算 payload.bin 的实际起始位置
+      const fileDataOffset = localHeaderOffset + 30 + localFileNameLength + localExtraFieldLength;
+      console.log('Found payload.bin at offset:', fileDataOffset);
+
+      return {
+        offset: fileDataOffset,
+        buffer: new ArrayBuffer(0) // 占位符
+      };
+    }
+
+    offset += 46 + fileNameLength + extraFieldLength + fileCommentLength;
+  }
+
+  throw new Error('payload.bin not found in ZIP central directory');
 }
 
 // 读取 payload.bin 头部信息
@@ -402,10 +452,64 @@ async function processUrl(url: string, partitions: string[]) {
   console.log('Using proxy URL:', finalUrl);
   
   try {
-    // 首先读取头部信息
-    console.log('Reading payload header...');
+    // 首先尝试检测文件类型
+    console.log('Detecting file type...');
+    const typeResponse = await fetch(finalUrl, {
+      headers: {
+        'Range': 'bytes=0-3',
+        'Accept': '*/*',
+      }
+    });
+
+    if (!typeResponse.ok) {
+      throw new Error(`Failed to detect file type: ${typeResponse.status} ${typeResponse.statusText}`);
+    }
+
+    const magicBuffer = await typeResponse.arrayBuffer();
+    const magicView = new DataView(magicBuffer);
+    const magic = magicView.getUint32(0, true);
+    
+    console.log('File magic number:', magic.toString(16));
+    
+    let payloadOffset = 0;
+    if (magic === 0x04034b50) {
+      console.log('Detected ZIP file format');
+      const zipInfo = await readZipPayload(finalUrl);
+      payloadOffset = zipInfo.offset;
+      console.log('Found payload.bin at offset:', payloadOffset);
+    } else if (magic === 0xed26ff3a) {
+      console.log('Detected direct payload.bin format');
+    } else {
+      throw new Error(`Unknown file format: ${magic.toString(16)}`);
+    }
+
+    // 读取 payload 头部
+    console.log('Reading payload header from offset:', payloadOffset);
+    const headerResponse = await fetch(finalUrl, {
+      headers: {
+        'Range': `bytes=${payloadOffset}-${payloadOffset + 8191}`,
+        'Accept': '*/*',
+      }
+    });
+
+    if (!headerResponse.ok) {
+      throw new Error(`Failed to read payload header: ${headerResponse.status} ${headerResponse.statusText}`);
+    }
+
+    const headerBuffer = await headerResponse.arrayBuffer();
+    const headerView = new DataView(headerBuffer);
+    
+    // 验证 payload 魔数
+    const payloadMagic = headerView.getUint32(0, true);
+    console.log('Payload magic number:', payloadMagic.toString(16));
+    
+    if (payloadMagic !== 0xed26ff3a) {
+      throw new Error(`Invalid payload magic number: ${payloadMagic.toString(16)}`);
+    }
+
+    // 继续处理 payload 头部
     const header = await readPayloadHeader(finalUrl);
-    console.log('Payload header:', JSON.stringify(header, null, 2));
+    console.log('Successfully parsed payload header:', JSON.stringify(header, null, 2));
 
     // 为每个请求的分区创建 blob
     for (const partitionName of partitions) {
