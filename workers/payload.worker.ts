@@ -1,7 +1,7 @@
 /// <reference lib="webworker" />
 
-import { PayloadInfo } from '@/lib/payloadHandler'
-import { PayloadParser } from '@/lib/payloadParser'
+import type { PayloadInfo } from '../lib/payloadHandler'
+import { PayloadParser } from '../lib/payloadParser'
 
 declare const self: DedicatedWorkerGlobalScope
 

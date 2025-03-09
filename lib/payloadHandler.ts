@@ -33,10 +33,13 @@ export class PayloadHandler {
 
   private initializeWorker() {
     if (typeof window !== 'undefined') {
-      // 动态导入 Worker
-      import('../workers/payload.worker?worker').then(Worker => {
-        this.worker = new Worker.default();
-      });
+      try {
+        // 动态导入 Worker
+        const workerUrl = new URL('../workers/payload.worker.ts', import.meta.url);
+        this.worker = new Worker(workerUrl, { type: 'module' });
+      } catch (error) {
+        console.error('Failed to initialize worker:', error);
+      }
     }
   }
 
