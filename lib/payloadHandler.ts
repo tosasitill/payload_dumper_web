@@ -13,6 +13,10 @@ interface WorkerResponse {
   };
 }
 
+type WorkerModule = {
+  default: new () => Worker;
+};
+
 export class PayloadHandler {
   private static instance: PayloadHandler;
   private worker: Worker | null = null;
@@ -31,12 +35,20 @@ export class PayloadHandler {
     return PayloadHandler.instance;
   }
 
-  private initializeWorker() {
+  private async initializeWorker() {
     if (typeof window !== 'undefined') {
       try {
-        // 动态导入 Worker
-        const workerUrl = new URL('../workers/payload.worker.ts', import.meta.url);
-        this.worker = new Worker(workerUrl, { type: 'module' });
+        const WorkerModule = await import('../workers/payload.worker') as WorkerModule;
+        console.log('Worker module loaded');
+        this.worker = new WorkerModule.default();
+        console.log('Worker initialized');
+
+        if (this.worker) {
+          // 添加错误处理
+          this.worker.onerror = (error) => {
+            console.error('Worker error:', error);
+          };
+        }
       } catch (error) {
         console.error('Failed to initialize worker:', error);
       }
@@ -44,15 +56,22 @@ export class PayloadHandler {
   }
 
   public async processPayload(info: PayloadInfo): Promise<void> {
+    console.log('Processing payload:', info);
     return new Promise((resolve, reject) => {
       if (!this.worker) {
-        this.initializeWorker();
+        console.log('Worker not initialized, initializing...');
+        this.initializeWorker().catch(error => {
+          console.error('Failed to initialize worker:', error);
+          reject(error);
+        });
       }
 
       // 等待 Worker 初始化完成
       const waitForWorker = () => {
         if (this.worker) {
+          console.log('Worker ready, sending message');
           const handleMessage = (e: MessageEvent<WorkerResponse>) => {
+            console.log('Received worker message:', e.data);
             if (e.data.type === 'success') {
               resolve();
               this.worker?.removeEventListener('message', handleMessage);
@@ -70,6 +89,7 @@ export class PayloadHandler {
             payload: info
           });
         } else {
+          console.log('Worker not ready, waiting...');
           setTimeout(waitForWorker, 100);
         }
       };

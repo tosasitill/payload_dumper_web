@@ -10,6 +10,7 @@ const nextConfig = {
             options: {
               filename: 'static/[hash].worker.js',
               publicPath: '/_next/',
+              inline: 'no-fallback',
             },
           },
           {
