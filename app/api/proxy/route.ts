@@ -5,9 +5,17 @@ export const maxDuration = 60 // 设置最大超时时间为 60 秒（Vercel hob
 export async function GET(request: NextRequest) {
   const url = request.nextUrl.searchParams.get('url')
   const rangeHeader = request.headers.get('Range')
+  const origin = request.headers.get('Origin') || '*'
 
   if (!url) {
-    return NextResponse.json({ error: 'URL is required' }, { status: 400 })
+    return NextResponse.json({ error: 'URL is required' }, { 
+      status: 400,
+      headers: {
+        'Access-Control-Allow-Origin': origin,
+        'Access-Control-Allow-Methods': 'GET, OPTIONS',
+        'Access-Control-Allow-Headers': 'Range',
+      }
+    })
   }
 
   console.log('Proxying request to:', url)
@@ -17,7 +25,8 @@ export async function GET(request: NextRequest) {
     const timeoutId = setTimeout(() => controller.abort(), 55000) // 55 秒超时，留出一些缓冲时间
 
     const headers: HeadersInit = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+      'Accept': '*/*'
     }
 
     // 如果有 Range 头，则转发它
@@ -36,7 +45,15 @@ export async function GET(request: NextRequest) {
       console.error('Proxy request failed:', response.status, response.statusText)
       return NextResponse.json({
         error: `Failed to fetch: ${response.status} ${response.statusText}`
-      }, { status: response.status })
+      }, { 
+        status: response.status,
+        headers: {
+          'Access-Control-Allow-Origin': origin,
+          'Access-Control-Allow-Methods': 'GET, OPTIONS',
+          'Access-Control-Allow-Headers': 'Range',
+          'Access-Control-Expose-Headers': 'Content-Range, Accept-Ranges',
+        }
+      })
     }
 
     const contentType = response.headers.get('Content-Type')
@@ -54,11 +71,15 @@ export async function GET(request: NextRequest) {
     const responseHeaders: HeadersInit = {
       'Content-Type': contentType || 'application/octet-stream',
       'Content-Length': contentLength || String(blob.size),
-      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Origin': origin,
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Headers': 'Range',
+      'Access-Control-Expose-Headers': 'Content-Range, Accept-Ranges, Content-Length',
       'Cache-Control': 'no-cache, no-store, must-revalidate',
       'Pragma': 'no-cache',
       'Expires': '0',
-      'Accept-Ranges': 'bytes'
+      'Accept-Ranges': 'bytes',
+      'Vary': 'Origin'
     }
 
     // 如果有 Content-Range，则转发它
@@ -76,20 +97,27 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: errorMessage }, { 
       status: error instanceof Error && error.name === 'AbortError' ? 504 : 500,
       headers: {
-        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Origin': origin,
+        'Access-Control-Allow-Methods': 'GET, OPTIONS',
+        'Access-Control-Allow-Headers': 'Range',
+        'Access-Control-Expose-Headers': 'Content-Range, Accept-Ranges',
+        'Vary': 'Origin'
       }
     })
   }
 }
 
-export async function OPTIONS() {
+export async function OPTIONS(request: NextRequest) {
+  const origin = request.headers.get('Origin') || '*'
+  
   return new NextResponse(null, {
     headers: {
-      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Origin': origin,
       'Access-Control-Allow-Methods': 'GET, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, Range',
-      'Access-Control-Expose-Headers': 'Content-Range, Accept-Ranges',
+      'Access-Control-Allow-Headers': 'Content-Type, Range',
+      'Access-Control-Expose-Headers': 'Content-Range, Accept-Ranges, Content-Length',
       'Access-Control-Max-Age': '86400',
+      'Vary': 'Origin'
     },
   })
 } 
