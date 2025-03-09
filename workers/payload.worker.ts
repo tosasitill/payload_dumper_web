@@ -62,31 +62,116 @@ const getBaseUrl = () => {
   }
 };
 
-// 读取 payload.bin 头部信息
-async function readPayloadHeader(url: string): Promise<PayloadHeader> {
+// 读取 ZIP 文件中的 payload.bin
+async function readZipPayload(url: string): Promise<ArrayBuffer> {
+  // 首先读取 ZIP 文件头部来定位 payload.bin
   const response = await fetch(url, {
     headers: {
-      'Range': 'bytes=0-8191', // 读取前 8KB，确保有足够空间
+      'Range': 'bytes=0-16384', // 读取前 16KB，应该足够包含 ZIP 头部
       'Accept': '*/*',
     }
   });
 
   if (!response.ok) {
-    throw new Error(`Failed to fetch header: ${response.status} ${response.statusText}`);
+    throw new Error(`Failed to fetch ZIP header: ${response.status} ${response.statusText}`);
   }
 
   const buffer = await response.arrayBuffer();
-  if (buffer.byteLength < 8) {
-    throw new Error('Invalid payload header: too small');
+  const view = new DataView(buffer);
+  let offset = 0;
+
+  while (offset < buffer.byteLength - 4) {
+    const signature = view.getUint32(offset, true);
+    if (signature === 0x04034b50) { // ZIP 文件头签名
+      // 读取文件名长度
+      const fileNameLength = view.getUint16(offset + 26, true);
+      // 读取扩展字段长度
+      const extraFieldLength = view.getUint16(offset + 28, true);
+      // 读取压缩数据大小
+      const compressedSize = view.getUint32(offset + 18, true);
+      // 读取文件名
+      const fileNameBytes = new Uint8Array(buffer, offset + 30, fileNameLength);
+      const fileName = new TextDecoder().decode(fileNameBytes);
+
+      console.log('Found file in ZIP:', {
+        fileName,
+        compressedSize,
+        offset: offset + 30 + fileNameLength + extraFieldLength
+      });
+
+      if (fileName === 'payload.bin') {
+        // 找到了 payload.bin，现在下载完整的文件
+        const fileStart = offset + 30 + fileNameLength + extraFieldLength;
+        const fileData = await downloadRange(url, fileStart, fileStart + compressedSize - 1);
+        
+        // 检查是否需要解压
+        const compressionMethod = view.getUint16(offset + 8, true);
+        if (compressionMethod === 0) { // 0 = 未压缩
+          return fileData;
+        } else {
+          throw new Error('Compressed payload.bin is not supported yet');
+        }
+      }
+
+      // 移动到下一个文件头
+      offset += 30 + fileNameLength + extraFieldLength + compressedSize;
+    } else {
+      offset++;
+    }
   }
 
-  const view = new DataView(buffer);
-  
+  throw new Error('payload.bin not found in ZIP file');
+}
+
+// 读取 payload.bin 头部信息
+async function readPayloadHeader(url: string): Promise<PayloadHeader> {
   try {
+    // 首先尝试直接读取 payload.bin
+    const response = await fetch(url, {
+      headers: {
+        'Range': 'bytes=0-3',
+        'Accept': '*/*',
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch header: ${response.status} ${response.statusText}`);
+    }
+
+    const magicBuffer = await response.arrayBuffer();
+    const magicView = new DataView(magicBuffer);
+    const magic = magicView.getUint32(0, true);
+
+    let payloadBuffer: ArrayBuffer;
+    if (magic === 0x04034b50) { // ZIP 文件
+      console.log('Detected ZIP file, extracting payload.bin...');
+      payloadBuffer = await readZipPayload(url);
+    } else {
+      // 直接读取前 8KB
+      const fullResponse = await fetch(url, {
+        headers: {
+          'Range': 'bytes=0-8191',
+          'Accept': '*/*',
+        }
+      });
+
+      if (!fullResponse.ok) {
+        throw new Error(`Failed to fetch payload: ${fullResponse.status} ${fullResponse.statusText}`);
+      }
+
+      payloadBuffer = await fullResponse.arrayBuffer();
+    }
+
+    if (payloadBuffer.byteLength < 8) {
+      throw new Error('Invalid payload header: too small');
+    }
+
+    const view = new DataView(payloadBuffer);
+    
     // 读取魔数（前 4 个字节）
-    const magic = view.getUint32(0, true);
-    if (magic !== 0xed26ff3a) { // PAYLOAD_MAGIC
-      throw new Error(`Invalid magic number: ${magic.toString(16)}`);
+    const payloadMagic = view.getUint32(0, true);
+    if (payloadMagic !== 0xed26ff3a) { // PAYLOAD_MAGIC
+      throw new Error(`Invalid payload magic number: ${payloadMagic.toString(16)}`);
     }
 
     // 读取版本号（接下来的 4 个字节）
@@ -97,7 +182,7 @@ async function readPayloadHeader(url: string): Promise<PayloadHeader> {
 
     // 读取头部大小（接下来的 8 个字节）
     const headerSize = Number(view.getBigUint64(8, true));
-    if (headerSize <= 0 || headerSize > buffer.byteLength) {
+    if (headerSize <= 0 || headerSize > payloadBuffer.byteLength) {
       throw new Error(`Invalid header size: ${headerSize}`);
     }
 
@@ -113,23 +198,23 @@ async function readPayloadHeader(url: string): Promise<PayloadHeader> {
     const manifest = [];
     let offset = 20; // 从第 20 个字节开始读取清单
     
-    for (let i = 0; i < manifestCount && offset + 4 <= buffer.byteLength; i++) {
+    for (let i = 0; i < manifestCount && offset + 4 <= payloadBuffer.byteLength; i++) {
       // 读取分区名长度
       const nameLength = view.getUint32(offset, true);
       offset += 4;
       
       // 安全检查
-      if (nameLength <= 0 || nameLength > 256 || offset + nameLength > buffer.byteLength) {
+      if (nameLength <= 0 || nameLength > 256 || offset + nameLength > payloadBuffer.byteLength) {
         throw new Error(`Invalid name length at entry ${i}: ${nameLength}`);
       }
       
       // 读取分区名
-      const nameBytes = new Uint8Array(buffer, offset, nameLength);
+      const nameBytes = new Uint8Array(payloadBuffer, offset, nameLength);
       const name = new TextDecoder().decode(nameBytes);
       offset += nameLength;
       
       // 安全检查
-      if (offset + 24 > buffer.byteLength) { // 8 bytes for size + 8 bytes for offset + 8 bytes for padding
+      if (offset + 24 > payloadBuffer.byteLength) { // 8 bytes for size + 8 bytes for offset + 8 bytes for padding
         throw new Error(`Buffer overflow at entry ${i}`);
       }
       
