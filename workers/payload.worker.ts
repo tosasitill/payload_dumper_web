@@ -55,7 +55,7 @@ const getBaseUrl = () => {
     }
     
     throw new Error('Unable to determine base URL');
-  } catch (error) {
+  } catch (error: unknown) {
     console.error('Failed to get base URL:', error);
     // 返回一个默认值而不是空字符串
     return 'https://payload-dumper.vercel.app';
@@ -66,7 +66,7 @@ const getBaseUrl = () => {
 async function readPayloadHeader(url: string): Promise<PayloadHeader> {
   const response = await fetch(url, {
     headers: {
-      'Range': 'bytes=0-4096', // 读取前 4KB，应该足够包含头部信息
+      'Range': 'bytes=0-8191', // 读取前 8KB，确保有足够空间
       'Accept': '*/*',
     }
   });
@@ -76,41 +76,87 @@ async function readPayloadHeader(url: string): Promise<PayloadHeader> {
   }
 
   const buffer = await response.arrayBuffer();
+  if (buffer.byteLength < 8) {
+    throw new Error('Invalid payload header: too small');
+  }
+
   const view = new DataView(buffer);
   
-  // 读取版本号（前 4 个字节）
-  const version = view.getUint32(0, true);
-  
-  // 读取清单条目数量（接下来的 4 个字节）
-  const manifestCount = view.getUint32(4, true);
-  
-  const manifest = [];
-  let offset = 8; // 从第 8 个字节开始读取清单
-  
-  for (let i = 0; i < manifestCount; i++) {
-    // 读取分区名长度
-    const nameLength = view.getUint32(offset, true);
-    offset += 4;
+  try {
+    // 读取版本号（前 4 个字节）
+    const version = view.getUint32(0, true);
     
-    // 读取分区名
-    const nameBytes = new Uint8Array(buffer, offset, nameLength);
-    const name = new TextDecoder().decode(nameBytes);
-    offset += nameLength;
+    // 读取清单条目数量（接下来的 4 个字节）
+    const manifestCount = view.getUint32(4, true);
     
-    // 读取分区大小和偏移
-    const size = Number(view.getBigUint64(offset, true));
-    offset += 8;
-    const partitionOffset = Number(view.getBigUint64(offset + 8, true));
-    offset += 16;
+    // 安全检查
+    if (manifestCount <= 0 || manifestCount > 100) {
+      throw new Error(`Invalid manifest count: ${manifestCount}`);
+    }
     
-    manifest.push({ name, size, offset: partitionOffset });
+    const manifest = [];
+    let offset = 8; // 从第 8 个字节开始读取清单
+    
+    for (let i = 0; i < manifestCount && offset + 4 <= buffer.byteLength; i++) {
+      // 读取分区名长度
+      const nameLength = view.getUint32(offset, true);
+      offset += 4;
+      
+      // 安全检查
+      if (nameLength <= 0 || nameLength > 256 || offset + nameLength > buffer.byteLength) {
+        throw new Error(`Invalid name length at entry ${i}: ${nameLength}`);
+      }
+      
+      // 读取分区名
+      const nameBytes = new Uint8Array(buffer, offset, nameLength);
+      const name = new TextDecoder().decode(nameBytes);
+      offset += nameLength;
+      
+      // 安全检查
+      if (offset + 24 > buffer.byteLength) { // 8 bytes for size + 16 bytes for offset
+        throw new Error(`Buffer overflow at entry ${i}`);
+      }
+      
+      // 读取分区大小和偏移
+      const size = Number(view.getBigUint64(offset, true));
+      offset += 8;
+      const partitionOffset = Number(view.getBigUint64(offset, true));
+      offset += 8;
+      
+      // 跳过额外的 8 字节（可能是对齐或其他数据）
+      offset += 8;
+      
+      // 安全检查
+      if (size <= 0 || size > Number.MAX_SAFE_INTEGER) {
+        throw new Error(`Invalid partition size at entry ${i}: ${size}`);
+      }
+      if (partitionOffset < 0 || partitionOffset > Number.MAX_SAFE_INTEGER) {
+        throw new Error(`Invalid partition offset at entry ${i}: ${partitionOffset}`);
+      }
+      
+      manifest.push({ name, size, offset: partitionOffset });
+      console.log(`Found partition: ${name} (size: ${size}, offset: ${partitionOffset})`);
+    }
+    
+    if (manifest.length === 0) {
+      throw new Error('No valid partitions found in manifest');
+    }
+    
+    return { version, manifest };
+  } catch (error: unknown) {
+    console.error('Failed to parse payload header:', error);
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to parse payload header: ${errorMessage}`);
   }
-  
-  return { version, manifest };
 }
 
 // 下载指定范围的数据
 async function downloadRange(url: string, start: number, end: number): Promise<ArrayBuffer> {
+  // 安全检查
+  if (start < 0 || end < start || end > Number.MAX_SAFE_INTEGER) {
+    throw new Error(`Invalid range: ${start}-${end}`);
+  }
+
   const response = await fetch(url, {
     headers: {
       'Range': `bytes=${start}-${end}`,
@@ -119,10 +165,16 @@ async function downloadRange(url: string, start: number, end: number): Promise<A
   });
 
   if (!response.ok && response.status !== 206) {
-    throw new Error(`Failed to fetch range: ${response.status} ${response.statusText}`);
+    const errorText = await response.text();
+    throw new Error(`Failed to fetch range: ${response.status} ${response.statusText}\n${errorText}`);
   }
 
-  return response.arrayBuffer();
+  const buffer = await response.arrayBuffer();
+  if (buffer.byteLength !== (end - start + 1)) {
+    console.warn(`Expected ${end - start + 1} bytes but got ${buffer.byteLength} bytes`);
+  }
+
+  return buffer;
 }
 
 self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
@@ -140,11 +192,12 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
       
       console.log('Processing completed successfully');
       self.postMessage({ type: 'success' } as WorkerResponse)
-    } catch (error) {
+    } catch (error: unknown) {
       console.error('Worker error:', error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
       self.postMessage({
         type: 'error',
-        error: error instanceof Error ? error.message : String(error)
+        error: errorMessage
       } as WorkerResponse)
     }
   }
@@ -180,13 +233,19 @@ async function processUrl(url: string, partitions: string[]) {
         // 查找分区信息
         const partition = header.manifest.find(m => m.name === partitionName);
         if (!partition) {
-          throw new Error(`Partition ${partitionName} not found in manifest`);
+          console.warn(`Partition ${partitionName} not found in manifest`);
+          continue;
         }
 
         console.log(`Downloading partition ${partitionName} (size: ${partition.size}, offset: ${partition.offset})`);
         
         // 下载分区数据
         const partitionData = await downloadRange(finalUrl, partition.offset, partition.offset + partition.size - 1);
+        
+        // 验证下载的数据大小
+        if (partitionData.byteLength !== partition.size) {
+          console.warn(`Downloaded size (${partitionData.byteLength}) doesn't match expected size (${partition.size}) for partition ${partitionName}`);
+        }
         
         // 创建 blob
         const blob = new Blob([partitionData], { type: 'application/octet-stream' });
@@ -200,13 +259,16 @@ async function processUrl(url: string, partitions: string[]) {
             url
           }
         } as WorkerResponse);
-      } catch (error) {
+      } catch (error: unknown) {
         console.error(`Failed to process partition ${partitionName}:`, error);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        throw new Error(`Failed to process partition ${partitionName}: ${errorMessage}`);
       }
     }
-  } catch (error) {
+  } catch (error: unknown) {
     console.error('Fetch error:', error);
-    throw error;
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to fetch: ${errorMessage}`);
   }
 }
 
@@ -230,8 +292,10 @@ async function processPayloadBuffer(buffer: ArrayBuffer, partitions: string[]) {
           url
         }
       } as WorkerResponse)
-    } catch (error) {
-      console.error(`Failed to extract partition ${partitionName}:`, error)
+    } catch (error: unknown) {
+      console.error(`Failed to extract partition ${partitionName}:`, error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to extract partition ${partitionName}: ${errorMessage}`);
     }
   }
-} 
+}
