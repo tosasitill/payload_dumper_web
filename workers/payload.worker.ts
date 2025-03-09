@@ -3,12 +3,14 @@
 import { PayloadInfo } from '@/lib/payloadHandler'
 import { PayloadParser } from '@/lib/payloadParser'
 
-interface WorkerMessage {
+declare const self: DedicatedWorkerGlobalScope
+
+type WorkerMessage = {
   type: 'process';
   payload: PayloadInfo;
 }
 
-interface WorkerResponse {
+type WorkerResponse = {
   type: 'success' | 'error' | 'progress';
   error?: string;
   progress?: {
