@@ -21,6 +21,18 @@ type WorkerResponse = {
 
 console.log('Worker script loaded');
 
+// 获取当前域名
+const getBaseUrl = () => {
+  try {
+    const workerLocation = self.location.href;
+    const url = new URL(workerLocation);
+    return `${url.protocol}//${url.host}`;
+  } catch (error) {
+    console.error('Failed to get base URL:', error);
+    return '';
+  }
+};
+
 self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
   console.log('Worker received message:', e.data);
   if (e.data.type === 'process') {
@@ -54,13 +66,26 @@ async function processFile(file: File, partitions: string[]) {
 
 async function processUrl(url: string, partitions: string[]) {
   console.log('Fetching URL:', url);
-  const proxyUrl = `/api/proxy?url=${encodeURIComponent(url)}`
-  const response = await fetch(proxyUrl)
-  if (!response.ok) {
-    throw new Error(`Failed to fetch: ${response.status} ${response.statusText}`)
+  const baseUrl = getBaseUrl();
+  if (!baseUrl) {
+    throw new Error('Failed to determine base URL');
   }
-  const arrayBuffer = await response.arrayBuffer()
-  await processPayloadBuffer(arrayBuffer, partitions)
+  
+  const proxyUrl = `${baseUrl}/api/proxy?url=${encodeURIComponent(url)}`;
+  console.log('Using proxy URL:', proxyUrl);
+  
+  try {
+    const response = await fetch(proxyUrl);
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Failed to fetch: ${response.status} ${response.statusText}\n${errorText}`);
+    }
+    const arrayBuffer = await response.arrayBuffer();
+    await processPayloadBuffer(arrayBuffer, partitions);
+  } catch (error) {
+    console.error('Fetch error:', error);
+    throw error;
+  }
 }
 
 async function processPayloadBuffer(buffer: ArrayBuffer, partitions: string[]) {
