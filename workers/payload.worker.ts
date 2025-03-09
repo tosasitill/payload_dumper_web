@@ -33,6 +33,58 @@ const getBaseUrl = () => {
   }
 };
 
+// 分块下载文件
+async function downloadInChunks(url: string, chunkSize: number = 10 * 1024 * 1024): Promise<ArrayBuffer> {
+  const firstResponse = await fetch(url, {
+    headers: { 'Range': 'bytes=0-0' }
+  });
+
+  if (!firstResponse.ok && firstResponse.status !== 206) {
+    throw new Error(`Failed to fetch: ${firstResponse.status} ${firstResponse.statusText}`);
+  }
+
+  const contentRange = firstResponse.headers.get('Content-Range');
+  if (!contentRange) {
+    // 服务器不支持范围请求，回退到普通下载
+    console.log('Server does not support range requests, falling back to normal download');
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch: ${response.status} ${response.statusText}`);
+    }
+    return response.arrayBuffer();
+  }
+
+  const totalSize = parseInt(contentRange.split('/')[1], 10);
+  const chunks: ArrayBuffer[] = [];
+
+  for (let start = 0; start < totalSize; start += chunkSize) {
+    const end = Math.min(start + chunkSize - 1, totalSize - 1);
+    console.log(`Downloading chunk: ${start}-${end}/${totalSize}`);
+
+    const response = await fetch(url, {
+      headers: { 'Range': `bytes=${start}-${end}` }
+    });
+
+    if (!response.ok && response.status !== 206) {
+      throw new Error(`Failed to fetch chunk: ${response.status} ${response.statusText}`);
+    }
+
+    const chunk = await response.arrayBuffer();
+    chunks.push(chunk);
+  }
+
+  // 合并所有块
+  const totalLength = chunks.reduce((acc, chunk) => acc + chunk.byteLength, 0);
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(new Uint8Array(chunk), offset);
+    offset += chunk.byteLength;
+  }
+
+  return result.buffer;
+}
+
 self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
   console.log('Worker received message:', e.data);
   if (e.data.type === 'process') {
@@ -75,12 +127,7 @@ async function processUrl(url: string, partitions: string[]) {
   console.log('Using proxy URL:', proxyUrl);
   
   try {
-    const response = await fetch(proxyUrl);
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Failed to fetch: ${response.status} ${response.statusText}\n${errorText}`);
-    }
-    const arrayBuffer = await response.arrayBuffer();
+    const arrayBuffer = await downloadInChunks(proxyUrl);
     await processPayloadBuffer(arrayBuffer, partitions);
   } catch (error) {
     console.error('Fetch error:', error);
