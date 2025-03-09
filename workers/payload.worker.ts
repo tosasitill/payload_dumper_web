@@ -19,6 +19,15 @@ type WorkerResponse = {
   };
 }
 
+type PayloadHeader = {
+  version: number;
+  manifest: {
+    name: string;
+    size: number;
+    offset: number;
+  }[];
+}
+
 console.log('Worker script loaded');
 
 // 获取当前域名
@@ -53,82 +62,67 @@ const getBaseUrl = () => {
   }
 };
 
-// 分块下载文件
-async function downloadInChunks(url: string, chunkSize: number = 10 * 1024 * 1024): Promise<ArrayBuffer> {
-  // 确保我们使用的是完整的 URL
-  let fullUrl = url;
-  if (!url.startsWith('http')) {
-    // 移除任何可能的 blob:// 前缀
-    const cleanUrl = url.replace(/^blob:\/+/g, '');
-    const baseUrl = getBaseUrl();
-    fullUrl = `${baseUrl}${cleanUrl.startsWith('/') ? '' : '/'}${cleanUrl}`;
-  }
-  console.log('Downloading from full URL:', fullUrl);
-
-  const firstResponse = await fetch(fullUrl, {
-    headers: { 
-      'Range': 'bytes=0-0',
+// 读取 payload.bin 头部信息
+async function readPayloadHeader(url: string): Promise<PayloadHeader> {
+  const response = await fetch(url, {
+    headers: {
+      'Range': 'bytes=0-4096', // 读取前 4KB，应该足够包含头部信息
       'Accept': '*/*',
-    },
-    credentials: 'same-origin'
+    }
   });
 
-  if (!firstResponse.ok && firstResponse.status !== 206) {
-    const errorText = await firstResponse.text();
-    throw new Error(`Failed to fetch: ${firstResponse.status} ${firstResponse.statusText}\n${errorText}`);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch header: ${response.status} ${response.statusText}`);
   }
 
-  const contentRange = firstResponse.headers.get('Content-Range');
-  if (!contentRange) {
-    // 服务器不支持范围请求，回退到普通下载
-    console.log('Server does not support range requests, falling back to normal download');
-    const response = await fetch(fullUrl, {
-      headers: {
-        'Accept': '*/*',
-      },
-      credentials: 'same-origin'
-    });
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Failed to fetch: ${response.status} ${response.statusText}\n${errorText}`);
+  const buffer = await response.arrayBuffer();
+  const view = new DataView(buffer);
+  
+  // 读取版本号（前 4 个字节）
+  const version = view.getUint32(0, true);
+  
+  // 读取清单条目数量（接下来的 4 个字节）
+  const manifestCount = view.getUint32(4, true);
+  
+  const manifest = [];
+  let offset = 8; // 从第 8 个字节开始读取清单
+  
+  for (let i = 0; i < manifestCount; i++) {
+    // 读取分区名长度
+    const nameLength = view.getUint32(offset, true);
+    offset += 4;
+    
+    // 读取分区名
+    const nameBytes = new Uint8Array(buffer, offset, nameLength);
+    const name = new TextDecoder().decode(nameBytes);
+    offset += nameLength;
+    
+    // 读取分区大小和偏移
+    const size = Number(view.getBigUint64(offset, true));
+    offset += 8;
+    const partitionOffset = Number(view.getBigUint64(offset + 8, true));
+    offset += 16;
+    
+    manifest.push({ name, size, offset: partitionOffset });
+  }
+  
+  return { version, manifest };
+}
+
+// 下载指定范围的数据
+async function downloadRange(url: string, start: number, end: number): Promise<ArrayBuffer> {
+  const response = await fetch(url, {
+    headers: {
+      'Range': `bytes=${start}-${end}`,
+      'Accept': '*/*',
     }
-    return response.arrayBuffer();
+  });
+
+  if (!response.ok && response.status !== 206) {
+    throw new Error(`Failed to fetch range: ${response.status} ${response.statusText}`);
   }
 
-  const totalSize = parseInt(contentRange.split('/')[1], 10);
-  const chunks: ArrayBuffer[] = [];
-
-  for (let start = 0; start < totalSize; start += chunkSize) {
-    const end = Math.min(start + chunkSize - 1, totalSize - 1);
-    console.log(`Downloading chunk: ${start}-${end}/${totalSize}`);
-
-    const response = await fetch(fullUrl, {
-      headers: { 
-        'Range': `bytes=${start}-${end}`,
-        'Accept': '*/*',
-      },
-      credentials: 'same-origin'
-    });
-
-    if (!response.ok && response.status !== 206) {
-      const errorText = await response.text();
-      throw new Error(`Failed to fetch chunk: ${response.status} ${response.statusText}\n${errorText}`);
-    }
-
-    const chunk = await response.arrayBuffer();
-    chunks.push(chunk);
-  }
-
-  // 合并所有块
-  const totalLength = chunks.reduce((acc, chunk) => acc + chunk.byteLength, 0);
-  const result = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(new Uint8Array(chunk), offset);
-    offset += chunk.byteLength;
-  }
-
-  return result.buffer;
+  return response.arrayBuffer();
 }
 
 self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
@@ -176,8 +170,40 @@ async function processUrl(url: string, partitions: string[]) {
   console.log('Using proxy URL:', finalUrl);
   
   try {
-    const arrayBuffer = await downloadInChunks(finalUrl);
-    await processPayloadBuffer(arrayBuffer, partitions);
+    // 首先读取头部信息
+    const header = await readPayloadHeader(finalUrl);
+    console.log('Payload header:', header);
+
+    // 为每个请求的分区创建 blob
+    for (const partitionName of partitions) {
+      try {
+        // 查找分区信息
+        const partition = header.manifest.find(m => m.name === partitionName);
+        if (!partition) {
+          throw new Error(`Partition ${partitionName} not found in manifest`);
+        }
+
+        console.log(`Downloading partition ${partitionName} (size: ${partition.size}, offset: ${partition.offset})`);
+        
+        // 下载分区数据
+        const partitionData = await downloadRange(finalUrl, partition.offset, partition.offset + partition.size - 1);
+        
+        // 创建 blob
+        const blob = new Blob([partitionData], { type: 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        
+        // 发送进度消息
+        self.postMessage({
+          type: 'progress',
+          progress: {
+            partition: partitionName,
+            url
+          }
+        } as WorkerResponse);
+      } catch (error) {
+        console.error(`Failed to process partition ${partitionName}:`, error);
+      }
+    }
   } catch (error) {
     console.error('Fetch error:', error);
     throw error;

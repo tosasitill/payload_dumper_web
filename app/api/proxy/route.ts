@@ -21,7 +21,7 @@ export async function GET(request: NextRequest) {
 
   // 清理 URL
   const cleanUrl = url.replace(/^blob:\/+/g, '');
-  console.log('Proxying request to:', cleanUrl);
+  console.log('Proxying request to:', cleanUrl, 'Range:', rangeHeader);
 
   try {
     const controller = new AbortController()
@@ -30,13 +30,14 @@ export async function GET(request: NextRequest) {
     const headers: HeadersInit = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
       'Accept': '*/*',
-      'Accept-Encoding': 'gzip, deflate, br',
+      'Accept-Encoding': 'identity', // 禁用压缩以确保正确的范围请求
       'Connection': 'keep-alive'
     }
 
     // 如果有 Range 头，则转发它
     if (rangeHeader) {
       headers['Range'] = rangeHeader
+      console.log('Forwarding Range header:', rangeHeader);
     }
 
     const response = await fetch(cleanUrl, {
@@ -49,8 +50,10 @@ export async function GET(request: NextRequest) {
 
     if (!response.ok && response.status !== 206) { // 206 是部分内容的状态码
       console.error('Proxy request failed:', response.status, response.statusText)
+      const errorText = await response.text()
+      console.error('Error response:', errorText)
       return NextResponse.json({
-        error: `Failed to fetch: ${response.status} ${response.statusText}`
+        error: `Failed to fetch: ${response.status} ${response.statusText}\n${errorText}`
       }, { 
         status: response.status,
         headers: {
@@ -66,11 +69,14 @@ export async function GET(request: NextRequest) {
     const contentType = response.headers.get('Content-Type')
     const contentLength = response.headers.get('Content-Length')
     const contentRange = response.headers.get('Content-Range')
+    const acceptRanges = response.headers.get('Accept-Ranges')
 
     console.log('Proxy response headers:', {
+      'Status': response.status,
       'Content-Type': contentType,
       'Content-Length': contentLength,
-      'Content-Range': contentRange
+      'Content-Range': contentRange,
+      'Accept-Ranges': acceptRanges
     })
 
     const blob = await response.blob()
@@ -87,7 +93,7 @@ export async function GET(request: NextRequest) {
       'Pragma': 'no-cache',
       'Expires': '0',
       'Accept-Ranges': 'bytes',
-      'Vary': 'Origin'
+      'Vary': 'Origin, Range'
     }
 
     // 如果有 Content-Range，则转发它
@@ -110,7 +116,7 @@ export async function GET(request: NextRequest) {
         'Access-Control-Allow-Headers': 'Range',
         'Access-Control-Allow-Credentials': 'true',
         'Access-Control-Expose-Headers': 'Content-Range, Accept-Ranges',
-        'Vary': 'Origin'
+        'Vary': 'Origin, Range'
       }
     })
   }
@@ -127,7 +133,7 @@ export async function OPTIONS(request: NextRequest) {
       'Access-Control-Allow-Credentials': 'true',
       'Access-Control-Expose-Headers': 'Content-Range, Accept-Ranges, Content-Length',
       'Access-Control-Max-Age': '86400',
-      'Vary': 'Origin'
+      'Vary': 'Origin, Range'
     },
   })
 } 
