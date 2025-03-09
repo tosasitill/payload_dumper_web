@@ -149,7 +149,7 @@ async function downloadRange(url: string, start: number, end: number, maxChunkSi
 }
 
 // 读取 ZIP 文件中的 payload.bin
-async function readZipPayload(url: string): Promise<ArrayBuffer> {
+async function readZipPayload(url: string): Promise<{ buffer: ArrayBuffer; offset: number }> {
   // 首先读取 ZIP 文件头部来定位 payload.bin
   const response = await fetch(url, {
     headers: {
@@ -186,14 +186,14 @@ async function readZipPayload(url: string): Promise<ArrayBuffer> {
       });
 
       if (fileName === 'payload.bin') {
-        // 找到了 payload.bin，现在下载完整的文件
+        // 找到了 payload.bin，返回其在 ZIP 文件中的位置信息
         const fileStart = offset + 30 + fileNameLength + extraFieldLength;
-        const fileData = await downloadRange(url, fileStart, fileStart + compressedSize - 1);
-        
-        // 检查是否需要解压
         const compressionMethod = view.getUint16(offset + 8, true);
         if (compressionMethod === 0) { // 0 = 未压缩
-          return fileData;
+          return {
+            offset: fileStart,
+            buffer: new ArrayBuffer(0) // 占位符
+          };
         } else {
           throw new Error('Compressed payload.bin is not supported yet');
         }
@@ -229,9 +229,26 @@ async function readPayloadHeader(url: string): Promise<PayloadHeader> {
     const magic = magicView.getUint32(0, true);
 
     let payloadBuffer: ArrayBuffer;
+    let zipOffset = 0;
+
     if (magic === 0x04034b50) { // ZIP 文件
-      console.log('Detected ZIP file, extracting payload.bin...');
-      payloadBuffer = await readZipPayload(url);
+      console.log('Detected ZIP file, locating payload.bin...');
+      const zipInfo = await readZipPayload(url);
+      zipOffset = zipInfo.offset;
+      
+      // 只读取 payload.bin 的头部
+      const headerResponse = await fetch(url, {
+        headers: {
+          'Range': `bytes=${zipOffset}-${zipOffset + 8191}`,
+          'Accept': '*/*',
+        }
+      });
+
+      if (!headerResponse.ok) {
+        throw new Error(`Failed to fetch payload header: ${headerResponse.status} ${headerResponse.statusText}`);
+      }
+
+      payloadBuffer = await headerResponse.arrayBuffer();
     } else {
       // 直接读取前 8KB
       const fullResponse = await fetch(url, {
@@ -321,8 +338,10 @@ async function readPayloadHeader(url: string): Promise<PayloadHeader> {
         throw new Error(`Invalid partition offset at entry ${i}: ${partitionOffset}`);
       }
       
-      manifest.push({ name, size, offset: partitionOffset });
-      console.log(`Found partition: ${name} (size: ${size}, offset: ${partitionOffset})`);
+      // 如果是 ZIP 文件，需要加上 payload.bin 在 ZIP 中的偏移量
+      const finalOffset = zipOffset + partitionOffset;
+      manifest.push({ name, size, offset: finalOffset });
+      console.log(`Found partition: ${name} (size: ${size}, offset: ${finalOffset})`);
     }
     
     if (manifest.length === 0) {
