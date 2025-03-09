@@ -150,10 +150,20 @@ async function downloadRange(url: string, start: number, end: number, maxChunkSi
 
 // 读取 ZIP 文件中的 payload.bin
 async function readZipPayload(url: string): Promise<{ buffer: ArrayBuffer; offset: number }> {
-  // 首先读取 ZIP 文件末尾以查找中央目录
+  // 首先尝试获取文件大小
+  const headResponse = await fetch(url, {
+    method: 'HEAD'
+  });
+  
+  const contentLength = headResponse.headers.get('content-length');
+  const fileSize = contentLength ? parseInt(contentLength, 10) : 0;
+  console.log('File size:', fileSize);
+
+  // 读取文件末尾
+  const endSize = Math.min(65536, fileSize || 65536);
   const response = await fetch(url, {
     headers: {
-      'Range': 'bytes=-65536', // 读取最后 64KB，应该足够包含中央目录
+      'Range': `bytes=-${endSize}`,
       'Accept': '*/*',
     }
   });
@@ -165,30 +175,85 @@ async function readZipPayload(url: string): Promise<{ buffer: ArrayBuffer; offse
   const endBuffer = await response.arrayBuffer();
   const endView = new DataView(endBuffer);
   
-  // 从末尾开始查找中央目录结束标记 (0x06054b50)
+  // 从末尾开始查找中央目录结束标记
   let eocdOffset = -1;
+  let isZip64 = false;
+
+  // 首先查找 ZIP64 结束标记
   for (let i = endBuffer.byteLength - 22; i >= 0; i--) {
-    if (endView.getUint32(i, true) === 0x06054b50) {
+    const sig = endView.getUint32(i, true);
+    if (sig === 0x06064b50) { // ZIP64 end of central directory
+      eocdOffset = i;
+      isZip64 = true;
+      break;
+    } else if (sig === 0x06054b50) { // Standard end of central directory
       eocdOffset = i;
       break;
     }
   }
 
   if (eocdOffset === -1) {
-    throw new Error('ZIP central directory end marker not found');
+    throw new Error('ZIP end of central directory not found');
   }
 
-  // 读取中央目录偏移量
-  const cdOffset = endView.getUint32(eocdOffset + 16, true);
-  const cdSize = endView.getUint32(eocdOffset + 12, true);
-  const totalEntries = endView.getUint16(eocdOffset + 10, true);
-  
-  console.log('ZIP central directory info:', {
+  console.log('Found EOCD:', { offset: eocdOffset, isZip64 });
+
+  let cdOffset: number;
+  let cdSize: number;
+  let totalEntries: number;
+
+  if (isZip64) {
+    // 读取 ZIP64 结构
+    cdSize = Number(endView.getBigUint64(eocdOffset + 40, true));
+    cdOffset = Number(endView.getBigUint64(eocdOffset + 48, true));
+    totalEntries = Number(endView.getBigUint64(eocdOffset + 32, true));
+  } else {
+    // 读取标准结构
+    cdSize = endView.getUint32(eocdOffset + 12, true);
+    cdOffset = endView.getUint32(eocdOffset + 16, true);
+    totalEntries = endView.getUint16(eocdOffset + 10, true);
+
+    // 检查是否需要切换到 ZIP64
+    if (cdOffset === 0xFFFFFFFF || cdSize === 0xFFFFFFFF || totalEntries === 0xFFFF) {
+      // 查找 ZIP64 结束定位器
+      const locOffset = eocdOffset - 20;
+      if (locOffset >= 0 && endView.getUint32(locOffset, true) === 0x07064b50) {
+        const zip64EocdOffset = Number(endView.getBigUint64(locOffset + 8, true));
+        
+        // 读取 ZIP64 EOCD
+        const zip64Response = await fetch(url, {
+          headers: {
+            'Range': `bytes=${zip64EocdOffset}-${zip64EocdOffset + 255}`,
+            'Accept': '*/*',
+          }
+        });
+
+        if (!zip64Response.ok) {
+          throw new Error(`Failed to fetch ZIP64 EOCD: ${zip64Response.status}`);
+        }
+
+        const zip64Buffer = await zip64Response.arrayBuffer();
+        const zip64View = new DataView(zip64Buffer);
+
+        if (zip64View.getUint32(0, true) !== 0x06064b50) {
+          throw new Error('Invalid ZIP64 EOCD signature');
+        }
+
+        cdSize = Number(zip64View.getBigUint64(40, true));
+        cdOffset = Number(zip64View.getBigUint64(48, true));
+        totalEntries = Number(zip64View.getBigUint64(32, true));
+        isZip64 = true;
+      }
+    }
+  }
+
+  console.log('Central directory info:', {
     offset: cdOffset,
     size: cdSize,
-    entries: totalEntries
+    entries: totalEntries,
+    isZip64
   });
-  
+
   // 读取中央目录
   const cdResponse = await fetch(url, {
     headers: {
@@ -198,18 +263,30 @@ async function readZipPayload(url: string): Promise<{ buffer: ArrayBuffer; offse
   });
 
   if (!cdResponse.ok) {
-    throw new Error(`Failed to fetch ZIP central directory: ${cdResponse.status} ${cdResponse.statusText}`);
+    throw new Error(`Failed to fetch central directory: ${cdResponse.status}`);
   }
 
   const cdBuffer = await cdResponse.arrayBuffer();
   const cdView = new DataView(cdBuffer);
   let offset = 0;
-  const possibleNames = ['payload.bin', 'PAYLOAD.BIN', 'payload.img', 'PAYLOAD.IMG'];
 
-  // 遍历中央目录寻找 payload.bin
+  // 扩展可能的文件名列表
+  const possibleNames = [
+    'payload.bin',
+    'PAYLOAD.BIN',
+    'payload.img',
+    'PAYLOAD.IMG',
+    'images/payload.bin',
+    'images/PAYLOAD.BIN',
+    'firmware-update/payload.bin',
+    'META-INF/payload.bin',
+    'OTA/payload.bin'
+  ];
+
+  // 遍历中央目录
   while (offset < cdBuffer.byteLength) {
     const signature = cdView.getUint32(offset, true);
-    if (signature !== 0x02014b50) { // 中央目录文件头标记
+    if (signature !== 0x02014b50) {
       console.log('Reached end of central directory at offset:', offset);
       break;
     }
@@ -217,27 +294,45 @@ async function readZipPayload(url: string): Promise<{ buffer: ArrayBuffer; offse
     const fileNameLength = cdView.getUint16(offset + 28, true);
     const extraFieldLength = cdView.getUint16(offset + 30, true);
     const fileCommentLength = cdView.getUint16(offset + 32, true);
-    const localHeaderOffset = cdView.getUint32(offset + 42, true);
+    let localHeaderOffset = cdView.getUint32(offset + 42, true);
     const compressionMethod = cdView.getUint16(offset + 10, true);
-    
+
     // 读取文件名
     const fileNameBytes = new Uint8Array(cdBuffer, offset + 46, fileNameLength);
     const fileName = new TextDecoder().decode(fileNameBytes);
-    
-    console.log('Found file in ZIP:', {
+
+    console.log('Found file:', {
       name: fileName,
       compression: compressionMethod,
       offset: localHeaderOffset
     });
 
+    // 如果是 ZIP64，检查并读取真实偏移量
+    if (localHeaderOffset === 0xFFFFFFFF) {
+      let zip64ExtraOffset = offset + 46 + fileNameLength;
+      const zip64ExtraEnd = zip64ExtraOffset + extraFieldLength;
+      
+      while (zip64ExtraOffset < zip64ExtraEnd) {
+        const headerId = cdView.getUint16(zip64ExtraOffset, true);
+        const dataSize = cdView.getUint16(zip64ExtraOffset + 2, true);
+        
+        if (headerId === 0x0001) { // ZIP64 扩展信息
+          localHeaderOffset = Number(cdView.getBigUint64(zip64ExtraOffset + 4, true));
+          break;
+        }
+        
+        zip64ExtraOffset += 4 + dataSize;
+      }
+    }
+
     // 检查是否是我们要找的文件
     const isPayloadFile = possibleNames.some(name => 
-      fileName.toLowerCase().endsWith(name.toLowerCase())
+      fileName.toLowerCase().includes(name.toLowerCase())
     );
 
     if (isPayloadFile) {
       console.log('Found potential payload file:', fileName);
-      
+
       if (compressionMethod !== 0) {
         console.log('File is compressed, trying next file...');
         offset += 46 + fileNameLength + extraFieldLength + fileCommentLength;
@@ -253,49 +348,59 @@ async function readZipPayload(url: string): Promise<{ buffer: ArrayBuffer; offse
       });
 
       if (!headerResponse.ok) {
-        throw new Error(`Failed to fetch local file header: ${headerResponse.status} ${headerResponse.statusText}`);
+        console.warn(`Failed to fetch local header for ${fileName}:`, headerResponse.status);
+        offset += 46 + fileNameLength + extraFieldLength + fileCommentLength;
+        continue;
       }
 
       const headerBuffer = await headerResponse.arrayBuffer();
       const headerView = new DataView(headerBuffer);
 
-      // 验证本地文件头签名
       if (headerView.getUint32(0, true) !== 0x04034b50) {
-        throw new Error('Invalid local file header signature');
-      }
-
-      const localFileNameLength = headerView.getUint16(26, true);
-      const localExtraFieldLength = headerView.getUint16(28, true);
-
-      // 计算文件数据的实际起始位置
-      const fileDataOffset = localHeaderOffset + 30 + localFileNameLength + localExtraFieldLength;
-      
-      // 验证文件头部是否为 payload 格式
-      const payloadHeaderResponse = await fetch(url, {
-        headers: {
-          'Range': `bytes=${fileDataOffset}-${fileDataOffset + 7}`,
-          'Accept': '*/*',
-        }
-      });
-
-      if (!payloadHeaderResponse.ok) {
-        console.log('Failed to read payload header, trying next file...');
+        console.warn(`Invalid local header signature for ${fileName}`);
         offset += 46 + fileNameLength + extraFieldLength + fileCommentLength;
         continue;
       }
 
-      const payloadHeaderBuffer = await payloadHeaderResponse.arrayBuffer();
-      const payloadHeaderView = new DataView(payloadHeaderBuffer);
-      const payloadMagic = payloadHeaderView.getUint32(0, true);
+      const localFileNameLength = headerView.getUint16(26, true);
+      const localExtraFieldLength = headerView.getUint16(28, true);
+      const fileDataOffset = localHeaderOffset + 30 + localFileNameLength + localExtraFieldLength;
 
-      if (payloadMagic === 0xed26ff3a) {
-        console.log('Found valid payload file at offset:', fileDataOffset);
-        return {
-          offset: fileDataOffset,
-          buffer: new ArrayBuffer(0) // 占位符
-        };
-      } else {
-        console.log('Invalid payload magic number, trying next file...');
+      // 验证文件头部
+      try {
+        const payloadHeaderResponse = await fetch(url, {
+          headers: {
+            'Range': `bytes=${fileDataOffset}-${fileDataOffset + 7}`,
+            'Accept': '*/*',
+          }
+        });
+
+        if (!payloadHeaderResponse.ok) {
+          console.warn(`Failed to read payload header for ${fileName}`);
+          offset += 46 + fileNameLength + extraFieldLength + fileCommentLength;
+          continue;
+        }
+
+        const payloadHeaderBuffer = await payloadHeaderResponse.arrayBuffer();
+        const payloadHeaderView = new DataView(payloadHeaderBuffer);
+        const payloadMagic = payloadHeaderView.getUint32(0, true);
+
+        if (payloadMagic === 0xed26ff3a) {
+          console.log('Found valid payload file:', {
+            name: fileName,
+            offset: fileDataOffset,
+            magic: payloadMagic.toString(16)
+          });
+          
+          return {
+            offset: fileDataOffset,
+            buffer: new ArrayBuffer(0)
+          };
+        } else {
+          console.log(`Invalid payload magic (${payloadMagic.toString(16)}) for ${fileName}`);
+        }
+      } catch (error) {
+        console.warn(`Error checking payload header for ${fileName}:`, error);
       }
     }
 
